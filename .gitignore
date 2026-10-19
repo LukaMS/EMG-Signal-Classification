@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.ipynb_checkpoints/
+
+# The public EMG data is downloaded separately and is not committed.
+data/raw/*
+!data/raw/.gitkeep
