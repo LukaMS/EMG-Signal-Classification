@@ -1,49 +1,40 @@
 # EMG Signal Classification Prototype
 
 This is the software proof-of-concept for our engineering capstone project.
-It classifies six movements from a recorded four-channel surface EMG signal.
-The method is based on *An EMG-Based Biofeedback System for Tailored
-Interventions Involving Distributed Muscles*:
+It classifies five movements (Rest, Left, Right, Rotate, Drop) from four-channel
+surface EMG recorded during a Tetris session. The model is trained on short
+calibration recordings, then classifies the live session, and its decisions are
+compared with the decisions recorded by the company's system. The method is
+based on *An EMG-Based Biofeedback System for Tailored Interventions Involving
+Distributed Muscles*:
 
-1. second-order 20-400 Hz Butterworth band-pass filtering;
-2. 64 ms windows with a 32 ms hop;
-3. RMS, waveform length, zero-crossing, and slope-sign-change features;
-4. five-dimensional multiclass LDA followed by Gaussian Naive Bayes; and
-5. one majority-voted decision for every five feature windows.
+1. 20-400 Hz band-pass filtering of the raw live data (a causal high-pass and
+   low-pass filter; the calibration files arrive already filtered);
+2. 64 ms windows, one ending at each recorded decision time (the length is set
+   by `window_ms` in `PipelineConfig`);
+3. RMS, waveform length, zero-crossing, and slope-sign-change features; and
+4. four-dimensional multiclass LDA followed by Gaussian Naive Bayes.
 
 At this stage the code only works with recorded data. Hardware input and
-Tetris control are outside the scope of this prototype.
+Tetris control are outside the scope of this prototype. Majority voting
+(`predict_with_voting`) is implemented but not used.
 
-## Dataset
+## Data
 
-Use version 2 of the open [Dataset for multi-channel surface electromyography
-(sEMG) signals of hand gestures](https://data.mendeley.com/datasets/ckwc76xr2z/2)
-by Ozdemir, Kisa, Guren, and Akan. It is licensed under
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+Place these seven files directly in the `data/` folder:
 
-1. Open the dataset page and download one file from `sEMG-dataset/raw/mat`.
-   The pipeline intentionally uses the **raw**, not already-filtered, data.
-2. Rename the selected file to `participant.mat`.
-3. Place it at `data/raw/participant.mat`.
+| File | Contents |
+| --- | --- |
+| `calibration_data_Rest.csv`, `_Left.csv`, `_Right.csv`, `_Rotate.csv`, `_Drop.csv` | One 4-second, already-filtered, four-column recording per movement (1 kHz, no header) |
+| `live_samples.csv` | The raw, unfiltered four-column recording of the game session (1 kHz, no header) |
+| `decision_times.csv` | The company's decisions: `Time_s`, `Decision`, `Speed_index` (header row) |
 
-Dataset files are excluded from Git. The MAT file must contain the variables
-`data` and `fs`; the optional `iD` variable is used as the participant label.
+Decision codes: 0 = Rest, 1 = Left, 2 = Right, 3 = Rotate, 5 = Drop. The speed
+column is ignored. The channels appear to be left forearm, left quad, right
+quad, and right forearm (inferred from the calibration files).
 
-The notebook retains the six gestures used by the reference paper:
-
-| Dataset gesture | Class label | Intended control |
-| --- | --- | --- |
-| Rest | `rest` | No input |
-| Wrist flexion | `wrist_flexion` | Left |
-| Wrist extension | `wrist_extension` | Right |
-| Supination | `supination` | Rotate right |
-| Pronation | `pronation` | Rotate left |
-| Finger abduction | `finger_abduction` | Drop |
-
-The timing schedule comes from the dataset authors' published
-[segmentation procedure](https://www.mathworks.com/matlabcentral/answers/1719545-emg-gesture-segmentation-issues):
-five repetitions start at 4, 138, 272, 406, and 540 seconds; each gesture is
-the first six seconds of its ten-second slot.
+The data files are excluded from Git because they are patient recordings
+supplied by the company.
 
 ## Setup
 
@@ -69,31 +60,35 @@ python -m jupyter notebook emg_classifier_demo.ipynb
 ```
 
 Run the notebook from the repository root so that the local `emg_pipeline`
-package and `data/raw/participant.mat` resolve correctly.
+package resolves correctly. The seven CSV files must be in `data/`.
 
 ## Expected output
 
-For one complete participant file, the pipeline produces:
+With the default settings, the notebook produces:
 
-- 30 trials: six classes by five repetitions;
-- 186 overlapping windows per six-second trial;
-- 5,580 windows total, balanced at 930 per class; and
-- 16 features per window: four features from each of four channels.
+- 620 training windows, 124 per movement (64 ms windows every 32 ms from each
+  4-second calibration file), with 16 features per window;
+- one classification for each of the company's decisions (about 28,500), using
+  the window that ends at that decision's timestamp;
+- overall and balanced accuracy, plus precision, recall, and F1 for each movement;
+- a confusion matrix;
+- a step-line timeline of the company's decisions and ours for the whole session;
+- a zoomed view of a few seconds showing both sets of decisions above the
+  amplitude of all four channels, with the windows where we disagree shaded.
 
-The notebook reports shuffled, stratified five-fold accuracy and per-class
-precision as mean (standard deviation).
-Its visuals mirror the paper's calibration-signal panel and two-dimensional
-LDA projection.
-
-Five-window majority voting remains implemented in `predict_with_voting` for
-future use on a chronological hardware/game stream.
+Change `window_ms` in the notebook's `PipelineConfig(...)` to test other window
+lengths.
 
 ## Limitations
 
-- The example uses one healthy participant, so the result cannot be treated as
-  performance on a person with MS.
-- The cross-validation split is made at the window level to match the paper.
-  Since neighbouring windows overlap, the reported accuracy may be optimistic.
-- The filter is offline and zero-phase. A live version will need a causal
-  implementation.
+- The data is one session from one patient, with only 4 seconds of calibration
+  per movement.
+- The company's decisions come from their own classifier, so the results
+  measure agreement with it, not correctness.
+- The filter used on the calibration data is assumed to be a 20-400 Hz band-pass;
+  the exact filter is not known.
+- Agreement is highest when our decisions are compared with the company's
+  decisions about 320 ms later, which suggests their output is smoothed. We do
+  not reproduce that yet.
+- The channel order is inferred from the calibration files.
 - This is an engineering prototype, not a medical device or clinical tool.

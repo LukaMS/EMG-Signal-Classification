@@ -1,35 +1,22 @@
-"""Filtering, windowing, and feature extraction for the EMG data."""
+"""Filtering, windowing, and feature extraction."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
-
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.signal import butter, sosfilt, sosfilt_zi, sosfiltfilt
 
-from .data import EXPECTED_CHANNELS, Trial
+from .config import NUM_CHANNELS, PipelineConfig
 
-LOW_CUTOFF_HZ = 20.0
-HIGH_CUTOFF_HZ = 400.0
-FILTER_ORDER = 2
-WINDOW_MILLISECONDS = 64
-HOP_MILLISECONDS = 32
-
-
-@dataclass(frozen=True)
-class FeatureSet:
-    """Feature rows and their movement labels."""
-
-    X: np.ndarray
-    y: np.ndarray
+# Feature extraction is done in batches to keep memory use modest.
+_BATCH_SIZE = 4_096
 
 
 def _validate_signal(signal: np.ndarray, *, name: str = "signal") -> np.ndarray:
     array = np.asarray(signal, dtype=np.float64)
-    if array.ndim != 2 or array.shape[1] != EXPECTED_CHANNELS:
+    if array.ndim != 2 or array.shape[1] != NUM_CHANNELS:
         raise ValueError(
-            f"{name} must have shape (samples, {EXPECTED_CHANNELS}); "
+            f"{name} must have shape (samples, {NUM_CHANNELS}); "
             f"received {array.shape}."
         )
     if not np.isfinite(array).all():
@@ -37,114 +24,119 @@ def _validate_signal(signal: np.ndarray, *, name: str = "signal") -> np.ndarray:
     return array
 
 
-def filter_recording(signal: np.ndarray, fs: int) -> np.ndarray:
-    """Apply an offline zero-phase, second-order 20-400 Hz Butterworth filter."""
+def filter_signal(signal: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
+    """Band-pass raw data with a high-pass filter followed by a low-pass filter.
 
-    array = _validate_signal(signal, name="recording")
-    if fs <= 2 * HIGH_CUTOFF_HZ:
-        raise ValueError(
-            f"Sampling rate must be greater than {2 * HIGH_CUTOFF_HZ:g} Hz "
-            f"for a {HIGH_CUTOFF_HZ:g} Hz cutoff; received {fs} Hz."
-        )
+    By default the filter is causal (it only uses past samples), as it would be
+    on the ESP32. It starts from the steady state for the first sample, so the
+    large constant offset in the raw data does not cause a start-up spike.
+    """
 
-    sos = butter(
-        FILTER_ORDER,
-        [LOW_CUTOFF_HZ, HIGH_CUTOFF_HZ],
-        btype="bandpass",
-        fs=fs,
-        output="sos",
+    array = _validate_signal(signal, name="signal")
+    high = butter(
+        cfg.filter_order, cfg.highpass_hz, btype="highpass", fs=cfg.fs, output="sos"
     )
-    return sosfiltfilt(sos, array, axis=0)
+    low = butter(
+        cfg.filter_order, cfg.lowpass_hz, btype="lowpass", fs=cfg.fs, output="sos"
+    )
+    sos = np.vstack((high, low))
 
+    if not cfg.causal_filter:
+        return sosfiltfilt(sos, array, axis=0)
 
-def _milliseconds_to_samples(milliseconds: int, fs: int, *, name: str) -> int:
-    samples = milliseconds * fs / 1_000
-    rounded = int(round(samples))
-    if not np.isclose(samples, rounded):
-        raise ValueError(
-            f"{name} ({milliseconds} ms) is not an integer number of samples at {fs} Hz."
-        )
-    return rounded
+    initial_state = sosfilt_zi(sos)[:, :, None] * array[0][None, None, :]
+    filtered, _ = sosfilt(sos, array, axis=0, zi=initial_state)
+    return filtered
 
 
 def window_signal(
-    signal: np.ndarray,
-    fs: int,
-    *,
-    window_ms: int = WINDOW_MILLISECONDS,
-    hop_ms: int = HOP_MILLISECONDS,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Split one trial into overlapping windows without crossing its boundaries."""
+    signal: np.ndarray, window_samples: int, hop_samples: int
+) -> np.ndarray:
+    """Cut a signal into windows of window_samples, starting every hop_samples.
 
-    array = _validate_signal(signal, name="trial signal")
-    window_samples = _milliseconds_to_samples(window_ms, fs, name="Window length")
-    hop_samples = _milliseconds_to_samples(hop_ms, fs, name="Hop length")
+    Returns an array of shape (windows, window_samples, 4).
+    """
+
+    array = _validate_signal(signal, name="signal")
     if window_samples <= 0 or hop_samples <= 0:
-        raise ValueError("Window and hop lengths must be positive.")
+        raise ValueError("window_samples and hop_samples must be positive.")
     if array.shape[0] < window_samples:
         raise ValueError(
-            f"Trial contains {array.shape[0]} samples, fewer than the "
-            f"{window_samples}-sample window."
+            f"Signal has {array.shape[0]} samples, fewer than the "
+            f"window length of {window_samples}."
         )
 
-    starts = np.arange(
-        0, array.shape[0] - window_samples + 1, hop_samples, dtype=np.int64
-    )
-    windows = np.stack([array[start : start + window_samples] for start in starts])
-    return windows, starts
+    windows = sliding_window_view(array, window_samples, axis=0)  # (n, 4, window)
+    return windows[::hop_samples].transpose(0, 2, 1)
+
+
+def windows_ending_at(
+    signal: np.ndarray, end_indices: np.ndarray, window_samples: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cut one window ending at each of the given sample indices (inclusive).
+
+    Returns (windows, valid). `valid` has one entry per requested index and is
+    False where a full window does not fit inside the signal; no window is
+    returned for those entries.
+    """
+
+    array = _validate_signal(signal, name="signal")
+    ends = np.asarray(end_indices, dtype=np.int64)
+    if ends.ndim != 1:
+        raise ValueError("end_indices must be one-dimensional.")
+    if window_samples <= 0:
+        raise ValueError("window_samples must be positive.")
+
+    valid = (ends - window_samples + 1 >= 0) & (ends < array.shape[0])
+    offsets = np.arange(-window_samples + 1, 1)
+    windows = array[ends[valid][:, None] + offsets[None, :]]
+    return windows, valid
+
+
+def compute_features(windows: np.ndarray) -> np.ndarray:
+    """Return a (windows, 16) feature matrix from (windows, samples, 4) data.
+
+    Per channel: RMS, waveform length, zero crossings, and slope sign changes,
+    laid out channel by channel.
+    """
+
+    array = np.asarray(windows, dtype=np.float64)
+    if array.ndim != 3 or array.shape[2] != NUM_CHANNELS:
+        raise ValueError(
+            f"windows must have shape (windows, samples, {NUM_CHANNELS}); "
+            f"received {array.shape}."
+        )
+    if array.shape[1] < 3:
+        raise ValueError("Each window needs at least 3 samples.")
+    if not np.isfinite(array).all():
+        raise ValueError("windows contain NaN or infinite values.")
+
+    batches = []
+    for start in range(0, array.shape[0], _BATCH_SIZE):
+        batch = array[start : start + _BATCH_SIZE]
+        differences = np.diff(batch, axis=1)
+
+        rms = np.sqrt(np.mean(np.square(batch), axis=1))
+        waveform_length = np.sum(np.abs(differences), axis=1)
+        # The paper gives no noise threshold for ZC or SSC, so sign changes are
+        # counted directly.
+        zero_crossings = np.sum(batch[:, :-1] * batch[:, 1:] < 0, axis=1)
+        slope_sign_changes = np.sum(
+            differences[:, :-1] * differences[:, 1:] < 0, axis=1
+        )
+
+        stacked = np.stack(
+            (rms, waveform_length, zero_crossings, slope_sign_changes), axis=2
+        )  # (batch, channels, 4 features)
+        batches.append(stacked.reshape(batch.shape[0], -1))
+
+    if not batches:
+        return np.empty((0, NUM_CHANNELS * 4))
+    return np.vstack(batches)
 
 
 def compute_window_features(window: np.ndarray) -> np.ndarray:
-    """Return channel-major RMS, WL, ZC, and SSC features for one window."""
+    """Return the 16 features for a single (samples, 4) window."""
 
     array = _validate_signal(window, name="window")
-
-    differences = np.diff(array, axis=0)
-    rms = np.sqrt(np.mean(np.square(array), axis=0))
-    waveform_length = np.sum(np.abs(differences), axis=0)
-
-    # The paper does not give a noise threshold for ZC or SSC, so sign changes
-    # are counted directly.
-    zero_crossings = np.sum(array[:-1] * array[1:] < 0, axis=0)
-
-    first_slopes = differences[:-1]
-    second_slopes = differences[1:]
-    slope_sign_changes = np.sum(first_slopes * second_slopes < 0, axis=0)
-
-    # Rows are channels; columns are features, then flattened channel-by-channel.
-    features = np.column_stack(
-        (rms, waveform_length, zero_crossings, slope_sign_changes)
-    ).reshape(-1)
-    return np.asarray(features, dtype=np.float64)
-
-
-def extract_features(
-    trials: Sequence[Trial],
-    fs: int,
-) -> FeatureSet:
-    """Extract 16-element feature vectors from a sequence of labelled trials."""
-
-    if not trials:
-        raise ValueError("At least one trial is required for feature extraction.")
-
-    feature_rows: list[np.ndarray] = []
-    labels: list[str] = []
-
-    for trial in trials:
-        windows, _ = window_signal(trial.signal, fs)
-        for window in windows:
-            feature_rows.append(compute_window_features(window))
-            labels.append(trial.label)
-
-    X = np.vstack(feature_rows)
-    if X.shape[1] != EXPECTED_CHANNELS * 4:
-        raise RuntimeError(
-            f"Expected 16 features per window, generated {X.shape[1]}."
-        )
-    if not np.isfinite(X).all():
-        raise ValueError("Extracted feature matrix contains NaN or infinite values.")
-
-    return FeatureSet(
-        X=X,
-        y=np.asarray(labels, dtype=str),
-    )
+    return compute_features(array[None, :, :])[0]

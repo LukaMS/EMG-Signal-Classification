@@ -1,4 +1,4 @@
-"""Load one Ozdemir dataset recording and split it into gesture trials."""
+"""Loading the calibration, live, and decision CSV files."""
 
 from __future__ import annotations
 
@@ -6,175 +6,109 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy.io import loadmat
+import pandas as pd
 
-EXPECTED_FS = 2_000
-EXPECTED_CHANNELS = 4
-MINIMUM_RECORDING_SECONDS = 640
-TRIAL_SECONDS = 6
+from .config import CLASS_LABELS, DECISION_CODES, NUM_CHANNELS
 
-# Start of the first (rest) gesture in each published repetition.
-REPETITION_START_SECONDS = (4, 138, 272, 406, 540)
+# The repository's data folder, found relative to this file so it works no
+# matter where the notebook is launched from.
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-# Gesture numbers are the slots used by the dataset's published segmentation code.
-# This tuple is chronological within each repetition.
-GESTURES = (
-    (0, "rest", "no_input"),
-    (1, "wrist_extension", "right"),
-    (2, "wrist_flexion", "left"),
-    (6, "finger_abduction", "drop"),
-    (8, "supination", "rotate_right"),
-    (9, "pronation", "rotate_left"),
-)
+LIVE_FILENAME = "live_samples.csv"
+DECISIONS_FILENAME = "decision_times.csv"
 
-# Paper control order, used for metrics and display.
-CLASS_LABELS = (
-    "rest",
-    "wrist_flexion",
-    "wrist_extension",
-    "supination",
-    "pronation",
-    "finger_abduction",
-)
-@dataclass(frozen=True)
-class Recording:
-    """One continuous four-channel participant recording."""
 
-    signal: np.ndarray
-    fs: int
-    participant_id: str
+def calibration_filename(label: str) -> str:
+    return f"calibration_data_{label}.csv"
 
 
 @dataclass(frozen=True)
-class Trial:
-    """One labelled six-second gesture interval."""
+class Session:
+    """Everything recorded in one session."""
 
-    signal: np.ndarray
-    label: str
-    control: str
-    gesture_id: int
-    repetition: int
-    start_sample: int
-
-
-def _read_scalar(mat: dict[str, object], key: str) -> float:
-    if key not in mat:
-        raise ValueError(f"MAT file is missing required variable '{key}'.")
-    value = np.asarray(mat[key]).squeeze()
-    if value.size != 1:
-        raise ValueError(f"MAT variable '{key}' must contain exactly one value.")
-    return float(value)
+    calibration: dict[str, np.ndarray]  # movement -> (samples, 4), already filtered
+    live: np.ndarray  # (samples, 4), raw and unfiltered
+    decision_times_s: np.ndarray  # (decisions,) time of each decision in seconds
+    decisions: np.ndarray  # (decisions,) movement name for each decision
+    source: Path  # folder the files were loaded from
 
 
-def _normalise_signal(data: object) -> np.ndarray:
-    signal = np.asarray(data)
-    if signal.ndim != 2:
+def _read_signal(path: Path) -> np.ndarray:
+    """Read a CSV of four sensor columns with no header."""
+
+    try:
+        values = pd.read_csv(path, header=None, dtype=np.float64).to_numpy()
+    except ValueError as error:
         raise ValueError(
-            "MAT variable 'data' must be a two-dimensional samples-by-channels array."
-        )
-
-    if signal.shape[1] == EXPECTED_CHANNELS:
-        normalised = signal
-    elif signal.shape[0] == EXPECTED_CHANNELS:
-        normalised = signal.T
-    else:
+            f"{path.name} could not be read as four numeric columns without "
+            f"a header: {error}"
+        ) from error
+    if values.ndim != 2 or values.shape[1] != NUM_CHANNELS:
         raise ValueError(
-            "Expected exactly 4 EMG channels in MAT variable 'data'; "
-            f"received shape {signal.shape}."
+            f"{path.name} must have {NUM_CHANNELS} columns; found shape {values.shape}."
         )
-
-    if not np.issubdtype(normalised.dtype, np.number):
-        raise ValueError("MAT variable 'data' must contain numeric EMG samples.")
-
-    normalised = np.asarray(normalised, dtype=np.float64)
-    if not np.isfinite(normalised).all():
-        raise ValueError("EMG recording contains NaN or infinite values.")
-    return normalised
+    if values.shape[0] == 0:
+        raise ValueError(f"{path.name} is empty.")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{path.name} contains NaN or infinite values.")
+    return values
 
 
-def load_recording(path: str | Path) -> Recording:
-    """Load and validate one raw participant MAT file.
+def _read_decisions(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read decision_times.csv and convert the numeric codes to movement names."""
 
-    The returned signal always has shape ``(samples, 4)`` even when the source
-    file stores its channels as rows.
-    """
-
-    mat_path = Path(path)
-    if not mat_path.is_file():
-        raise FileNotFoundError(
-            f"EMG participant file was not found at '{mat_path}'. Download one raw "
-            "participant .mat file and save it as data/raw/participant.mat."
-        )
-
-    mat = loadmat(mat_path)
-    if "data" not in mat:
-        raise ValueError("MAT file is missing required variable 'data'.")
-
-    signal = _normalise_signal(mat["data"])
-    fs_value = _read_scalar(mat, "fs")
-    if not np.isclose(fs_value, EXPECTED_FS):
-        raise ValueError(
-            f"Expected a {EXPECTED_FS} Hz recording, but MAT variable 'fs' is "
-            f"{fs_value:g} Hz. Use a raw file from the documented dataset."
-        )
-
-    minimum_samples = MINIMUM_RECORDING_SECONDS * EXPECTED_FS
-    if signal.shape[0] < minimum_samples:
-        seconds = signal.shape[0] / EXPECTED_FS
-        raise ValueError(
-            f"Recording is too short ({seconds:.2f} s). The published segmentation "
-            f"schedule requires at least {MINIMUM_RECORDING_SECONDS} s."
-        )
-
-    participant_id = mat_path.stem
-    if "iD" in mat:
-        participant_value = np.asarray(mat["iD"]).squeeze()
-        if participant_value.size == 1:
-            participant_id = str(participant_value.item())
-
-    return Recording(signal=signal, fs=EXPECTED_FS, participant_id=participant_id)
-
-
-def segment_trials(recording: Recording) -> list[Trial]:
-    """Extract the six selected gestures from all five repetitions."""
-
-    if recording.fs != EXPECTED_FS:
-        raise ValueError(
-            f"Segmentation expects {EXPECTED_FS} Hz, received {recording.fs} Hz."
-        )
-    if recording.signal.ndim != 2 or recording.signal.shape[1] != EXPECTED_CHANNELS:
-        raise ValueError(
-            f"Segmentation expects samples x {EXPECTED_CHANNELS} channels; "
-            f"received {recording.signal.shape}."
-        )
-    if not np.isfinite(recording.signal).all():
-        raise ValueError("EMG recording contains NaN or infinite values.")
-
-    trials: list[Trial] = []
-    trial_samples = TRIAL_SECONDS * recording.fs
-
-    for repetition, repetition_start in enumerate(REPETITION_START_SECONDS, start=1):
-        for gesture_id, label, control in GESTURES:
-            start_second = repetition_start + gesture_id * 10
-            start_sample = start_second * recording.fs
-            end_sample = start_sample + trial_samples
-            if end_sample > recording.signal.shape[0]:
-                available_seconds = recording.signal.shape[0] / recording.fs
-                raise ValueError(
-                    "Recording is too short for the published segmentation schedule: "
-                    f"gesture '{label}' in repetition {repetition} ends at "
-                    f"{end_sample / recording.fs:.1f} s, but only "
-                    f"{available_seconds:.1f} s are available."
-                )
-            trials.append(
-                Trial(
-                    signal=recording.signal[start_sample:end_sample],
-                    label=label,
-                    control=control,
-                    gesture_id=gesture_id,
-                    repetition=repetition,
-                    start_sample=start_sample,
-                )
+    table = pd.read_csv(path)
+    for column in ("Time_s", "Decision"):
+        if column not in table.columns:
+            raise ValueError(
+                f"{path.name} must have a '{column}' column; "
+                f"found {list(table.columns)}."
             )
 
-    return trials
+    times = table["Time_s"].to_numpy(dtype=np.float64)
+    codes = table["Decision"].to_numpy(dtype=np.float64)
+    if times.size == 0:
+        raise ValueError(f"{path.name} is empty.")
+    if not np.isfinite(times).all() or not np.isfinite(codes).all():
+        raise ValueError(f"{path.name} contains NaN or infinite values.")
+    if np.any(np.diff(times) <= 0):
+        raise ValueError(f"Timestamps in {path.name} must be strictly increasing.")
+
+    int_codes = codes.astype(int)
+    unknown = sorted(set(int_codes.tolist()) - set(DECISION_CODES))
+    if unknown or not np.array_equal(int_codes, codes):
+        raise ValueError(
+            f"{path.name} contains decision codes {unknown or 'that are not whole numbers'}; "
+            f"expected only {sorted(DECISION_CODES)}."
+        )
+
+    labels = np.array([DECISION_CODES[code] for code in int_codes], dtype=str)
+    return times, labels
+
+
+def load_session(data_dir: str | Path = DATA_DIR) -> Session:
+    """Load the five calibration files, the live recording, and the decisions."""
+
+    folder = Path(data_dir)
+    paths = {label: folder / calibration_filename(label) for label in CLASS_LABELS}
+    live_path = folder / LIVE_FILENAME
+    decisions_path = folder / DECISIONS_FILENAME
+
+    expected = [*paths.values(), live_path, decisions_path]
+    missing = [path.name for path in expected if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing file(s) in '{folder}': {', '.join(missing)}."
+        )
+
+    calibration = {label: _read_signal(path) for label, path in paths.items()}
+    live = _read_signal(live_path)
+    times, labels = _read_decisions(decisions_path)
+
+    return Session(
+        calibration=calibration,
+        live=live,
+        decision_times_s=times,
+        decisions=labels,
+        source=folder,
+    )

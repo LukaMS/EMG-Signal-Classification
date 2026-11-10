@@ -5,6 +5,5 @@ __pycache__/
 .pytest-tmp/
 .ipynb_checkpoints/
 
-# The public EMG data is downloaded separately and is not committed.
-data/raw/*
-!data/raw/.gitkeep
+# Recorded session data is large and is not committed.
+data/*.csv
